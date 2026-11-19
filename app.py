@@ -1,253 +1,400 @@
-import difflib, io, os, re, sqlite3
-from datetime import datetime
-import cv2, numpy as np, pandas as pd, streamlit as st
-from PIL import Image
-try: import pytesseract
-except Exception: pytesseract=None
-try: import zxingcpp
-except Exception: zxingcpp=None
+"""Fleet Scan - mobile-first fleet stock count and vehicle identification (Streamlit)."""
+import html
+import io
+import logging
+import os
+import re
+import uuid
 
-st.set_page_config(page_title='Fleet Scan',page_icon='🚘',layout='centered',initial_sidebar_state='collapsed')
+import pandas as pd
+import streamlit as st
+
+import auth
+import fleet_repository as fr
+import image_reader as ir
+import photo_storage as ps
+import utils
+from scan_repository import SQLiteScanRepository
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(message)s')
+log = logging.getLogger('fleetscan')
+HERE = os.path.dirname(os.path.abspath(__file__))
+INDEX_FILE = 'fleet_index.csv'
+DB_FILE = 'fleet_scan.db'
+ACTIONS = ['Stock Count', 'Vehicle Received', 'Vehicle Moved', 'Inspection Completed',
+           'Vehicle Collected', 'Auction Preparation', 'Hayaza Check', 'Other']
+MODES = ['Plate', 'VIN label', 'VIN barcode / QR', 'Manual']
+UNMATCHED = 'Not in fleet (save as unmatched)'
+
+st.set_page_config(page_title='Fleet Scan', page_icon='🚘', layout='centered', initial_sidebar_state='collapsed')
 st.markdown('''<style>
-.stApp{background:#f3f6fa}.block-container{max-width:760px;padding:.6rem .7rem 5rem}
-.hero{background:linear-gradient(135deg,#052c55,#0876cf);color:#fff;padding:14px 16px;border-radius:15px;margin-bottom:10px}.hero h1{font-size:25px;margin:0}.hero p{font-size:13px;margin:3px 0 0;opacity:.9}
-.stButton button,.stDownloadButton button{min-height:50px;border-radius:11px;font-weight:750;width:100%}
-[data-testid="stCameraInput"] button{min-height:58px}.card{background:#fff;border:1px solid #dce5ef;border-radius:13px;padding:13px;margin:8px 0}.ok{background:#eaf8ef;border-left:6px solid #2f9e44;padding:12px;border-radius:9px}.bad{background:#fff0f0;border-left:6px solid #d93a3a;padding:12px;border-radius:9px}
-@media(max-width:640px){.block-container{padding-top:.35rem}.hero h1{font-size:22px}div[data-testid="stHorizontalBlock"]{gap:.45rem}}
-</style><div class="hero"><h1>Fleet Scan</h1><p>Photograph a plate or VIN, confirm the match, and save.</p></div>''',unsafe_allow_html=True)
+.stApp{background:#f3f6fa}.block-container{max-width:760px;padding:.6rem .7rem 5rem;overflow-x:hidden}
+.hero{background:linear-gradient(135deg,#052c55,#0876cf);color:#fff;padding:14px 16px;border-radius:15px;margin-bottom:8px}
+.hero h1{font-size:24px;margin:0;color:#fff}.hero p{font-size:13px;margin:3px 0 0;opacity:.92}
+.stButton button,.stDownloadButton button,[data-testid="stFormSubmitButton"] button{min-height:50px;border-radius:11px;font-weight:750}
+[data-testid="stCameraInput"] button{min-height:58px}
+.stTextInput input,.stTextArea textarea,[data-baseweb="select"]>div{min-height:48px}
+[data-testid="stImage"] img{max-height:300px;object-fit:contain}
+.card{background:#fff;border:1px solid #dce5ef;border-radius:13px;padding:11px 13px;margin:6px 0;font-size:14px;line-height:1.5;word-break:break-word}
+.ok{background:#e3f6ea;border-left:6px solid #1f7a35;padding:12px;border-radius:9px;color:#0b3d1a}
+.warn{background:#fff4d6;border-left:6px solid #b7791f;padding:12px;border-radius:9px;color:#5a3a00}
+.bad{background:#ffe5e5;border-left:6px solid #c52b2b;padding:12px;border-radius:9px;color:#6b0f0f}
+</style>''', unsafe_allow_html=True)
 
-FILES=[('List_Of_Vehicle_Status_new (Hertz).xlsx','Hertz',2),('MOOV vehicle with status 1311.xlsx','Moov',1),('Insurance Data (AFF).xlsx','AFF',3)]
-INDEX_FILE='fleet_index.csv'
-VIN_NAMES={'VIN','CHASSIS_NO','CHASSIS_NUMBER','VEHICLE_CHASSIS_NUMBER','FRAME_NO','VIN_CHASIS_NO','VIN_CHASSIS_NO'}
-PLATE_NAMES={'PLATE','PLATE_NO','PLATE_NUMBER','LICENSE_NO','LICENSE_NUMBER','REGISTRATION_NO','REGISTRATION_NO_'}
-ALIASES={'unit':{'UNIT_NO','UNIT_NUMBER','ASSET_NO','ASSET_NUMBER','ASSET_NO_CODE'},'make':{'MAKE','VEHICLE_MAKE','BRAND'},'model':{'MODEL','VEHICLE_MODEL','MODEL_DESCRIPTION'},'year':{'MODEL_YEAR','YEAR','VEHICLE_YEAR'},'branch':{'BRANCH','CURRENT_BRANCH','VEHICLE_BRANCH'},'location':{'LOCATION','CURRENT_LOCATION','YARD','CITY'},'status':{'STATUS','VEHICLE_STATUS','LA_STATUS'},'km':{'KM','KMS','KILOMETRES','KILOMETERS','CURRENT_ODOMETER','MILEAGE'}}
-ACTIONS=['Stock Count','Vehicle Received','Vehicle Moved','Inspection Completed','Vehicle Collected','Auction Preparation','Hayaza Check','Other']
-DB='fleet_scan.db'
-def txt(v):
-    if v is None or pd.isna(v): return ''
-    x=str(v).strip(); return x[:-2] if x.endswith('.0') and x[:-2].isdigit() else x
-def nc(v): return re.sub(r'_+','_',re.sub(r'[^A-Z0-9]+','_',txt(v).upper())).strip('_')
-def vin(v): return re.sub(r'[^A-Z0-9]','',txt(v).upper())
-def plate(v): return re.sub(r'[^A-Z0-9\u0600-\u06FF]','',txt(v).upper())
-def findcol(df,names):
-    m={nc(c):c for c in df.columns}
-    for n in names:
-        if n in m:return m[n]
-    for n,c in m.items():
-        if any(x in n for x in names):return c
 
-def prepare(df,file,sheet,owner,priority):
-    df=df.copy(); df.columns=[txt(c) for c in df.columns]
-    vc,pc=findcol(df,VIN_NAMES),findcol(df,PLATE_NAMES)
-    if not vc and not pc:return None
-    df['_vin']=df[vc].map(vin) if vc else ''; df['_plate']=df[pc].map(plate) if pc else ''
-    for k,a in ALIASES.items():
-        c=findcol(df,a); df['_'+k]=df[c].map(txt) if c else ''
-    df['_owner']=owner;df['_file']=file;df['_sheet']=sheet;df['_priority']=priority
-    return df[(df['_vin']!='')|(df['_plate']!='')]
+def secrets_dict():
+    try:
+        return utils.to_dict(st.secrets)
+    except Exception:
+        return {}
+
+
 @st.cache_data(show_spinner=False)
-def load_fleet_index():
-    path=os.path.join(os.path.dirname(os.path.abspath(__file__)),INDEX_FILE)
-    if not os.path.exists(path):
-        return pd.DataFrame(),[INDEX_FILE]
-    df=pd.read_csv(path,dtype=str,keep_default_na=False,encoding='utf-8-sig')
-    return df.rename(columns={
-        'vin':'_vin','plate':'_plate','unit':'_unit','make':'_make','model':'_model',
-        'year':'_year','branch':'_branch','location':'_location','status':'_status','km':'_km',
-        'owner':'_owner','source_file':'_file','source_sheet':'_sheet','priority':'_priority'
-    }),[]
+def cached_fleet(path):
+    try:
+        return fr.load_index(path), ''
+    except Exception:
+        log.exception('fleet index load failed')
+        return pd.DataFrame(), 'Fleet index could not be loaded.'
 
 
-
-SCAN_COLUMNS = {
-    'id': 'INTEGER PRIMARY KEY',
-    'scanned_on': 'TEXT',
-    'scanned_by': 'TEXT',
-    'action': 'TEXT',
-    'scan_type': 'TEXT',
-    'scanned_value': 'TEXT',
-    'confirmed_vin': 'TEXT',
-    'confirmed_plate': 'TEXT',
-    'owner': 'TEXT',
-    'unit': 'TEXT',
-    'make': 'TEXT',
-    'model': 'TEXT',
-    'year': 'TEXT',
-    'branch': 'TEXT',
-    'location': 'TEXT',
-    'status': 'TEXT',
-    'match_method': 'TEXT',
-    'source_file': 'TEXT',
-    'notes': 'TEXT',
-}
-
-def init_db():
-    # Streamlit Cloud may retain an older SQLite file from a previous app version.
-    # Create the table if missing, then migrate it by adding any new columns.
-    with sqlite3.connect(DB, timeout=30) as c:
-        c.execute('PRAGMA journal_mode=WAL')
-        c.execute('PRAGMA busy_timeout=30000')
-        c.execute('CREATE TABLE IF NOT EXISTS scan_log (' + ','.join(
-            f'{name} {definition}' for name, definition in SCAN_COLUMNS.items()
-        ) + ')')
-        existing = {
-            row[1] for row in c.execute('PRAGMA table_info(scan_log)').fetchall()
-        }
-        for name, definition in SCAN_COLUMNS.items():
-            if name not in existing and name != 'id':
-                c.execute(f'ALTER TABLE scan_log ADD COLUMN {name} {definition}')
-        c.commit()
+@st.cache_resource(show_spinner=False)
+def get_storage():
+    return ps.build_storage(secrets_dict())
 
 
-def read_scan_log():
-    init_db()
-    with sqlite3.connect(DB, timeout=30) as c:
-        try:
-            return pd.read_sql_query('SELECT * FROM scan_log ORDER BY id DESC', c)
-        except Exception:
-            # Recover from a stale/incompatible pilot database without crashing the app.
-            backup = DB + '.incompatible-' + datetime.now().strftime('%Y%m%d%H%M%S')
-            c.close()
-            if os.path.exists(DB):
-                os.replace(DB, backup)
-            init_db()
-            with sqlite3.connect(DB, timeout=30) as fresh:
-                return pd.read_sql_query('SELECT * FROM scan_log ORDER BY id DESC', fresh)
+@st.cache_resource(show_spinner=False)
+def get_repo():
+    try:
+        return SQLiteScanRepository(DB_FILE)
+    except Exception:
+        log.exception('scan repository init failed')
+        return None
 
 
-init_db(); fleet,missing=load_fleet_index()
+def box(kind, text):
+    st.markdown(f'<div class="{kind}">{text}</div>', unsafe_allow_html=True)
 
-def rotate(im,a):
-    if a==0:return im
-    h,w=im.shape[:2];m=cv2.getRotationMatrix2D((w/2,h/2),a,1);co,si=abs(m[0,0]),abs(m[0,1]);nw,nh=int(h*si+w*co),int(h*co+w*si);m[0,2]+=nw/2-w/2;m[1,2]+=nh/2-h/2
-    return cv2.warpAffine(im,m,(nw,nh),borderMode=cv2.BORDER_REPLICATE)
-def fast_variants(img, kind):
-    """Bounded preprocessing for Streamlit Cloud: 4 OCR images, not 30+."""
-    rgb=np.array(img.convert('RGB'))
-    h,w=rgb.shape[:2]
-    # Large phone photos are the main cause of hanging. Cap long edge at 1400px.
-    scale=min(1.0,1400.0/max(h,w))
-    if scale < 1.0:
-        rgb=cv2.resize(rgb,(int(w*scale),int(h*scale)),interpolation=cv2.INTER_AREA)
-    gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
-    clahe=cv2.createCLAHE(2.5,(8,8)).apply(gray)
-    sharp=cv2.addWeighted(clahe,1.5,cv2.GaussianBlur(clahe,(0,0),1.2),-.5,0)
-    binary=cv2.threshold(sharp,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
-    # VIN labels are often vertical. Only add one 90-degree version.
-    return [gray,sharp,binary,rotate(sharp,90)] if kind=='VIN' else [gray,sharp,binary]
 
-def ocr_read(img,kind):
-    if not pytesseract:return []
-    out=[]
-    whitelist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-    # One segmentation mode per image keeps scan time bounded.
-    config='--oem 3 --psm 11' + (f' -c tessedit_char_whitelist={whitelist}' if kind=='VIN' else '')
-    for im in fast_variants(img,kind):
-        try:
-            data=pytesseract.image_to_data(im,lang='eng',config=config,output_type=pytesseract.Output.DICT,timeout=4)
-        except Exception:
-            continue
-        words=[]
-        for text,conf in zip(data.get('text',[]),data.get('conf',[])):
-            try: good=float(conf)>=15
-            except Exception: good=False
-            x=re.sub(r'[^A-Z0-9\u0600-\u06FF]','',str(text).upper())
-            if good and x:
-                words.append(x)
-                if x not in out:out.append(x)
-        joined=''.join(words)
-        if joined and joined not in out:out.append(joined)
-    return out
+def to_excel(df):
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as w:
+        df.to_excel(w, index=False)
+    return out.getvalue()
 
-def direct_candidates(lines,kind):
-    out=[]
-    for line in lines:
-        c=vin(line) if kind=='VIN' else plate(line)
-        if kind=='VIN':
-            for i in range(max(1,len(c)-16)):
-                x=c[i:i+17]
-                if len(x)==17 and re.fullmatch(r'[A-HJ-NPR-Z0-9]{17}',x):out.append(x)
+
+# ------------------------------------------------------------------ login
+def login_page(users):
+    st.markdown('<div class="hero"><h1>Fleet Scan</h1><p>Sign in to start scanning.</p></div>', unsafe_allow_html=True)
+    if not users:
+        box('bad', 'No users are configured. Ask an administrator to add users to the app secrets.')
+    with st.form('login_form'):
+        u = st.text_input('Employee ID or username')
+        p = st.text_input('Password', type='password')
+        go = st.form_submit_button('Login', type='primary', width='stretch')
+    if go:
+        res = auth.authenticate(u, p, users)
+        if res.user:
+            auth.login(st.session_state, res.user)
+            st.rerun()
+        st.error(res.message)
+
+
+# ------------------------------------------------------------------ scan
+def reset_scan():
+    n = st.session_state.get('cam_n', 0) + 1
+    for k in ('matches', 'searched', 'read_key', 'ocr_conf', 'photo_raw', 'value_input', 'notice'):
+        st.session_state.pop(k, None)
+    st.session_state['cam_n'] = n
+
+
+def get_image(raw):
+    h = utils.image_hash(raw)
+    cache = st.session_state.get('img_cache')
+    if cache and cache[0] == h:
+        return h, cache[1], ''
+    try:
+        img = utils.load_image(raw)
+    except ValueError as exc:
+        log.warning('image rejected: %s', exc)
+        return h, None, str(exc)
+    st.session_state['img_cache'] = (h, img)
+    return h, img, ''
+
+
+def run_read(img, h, mode, kind, fleet):
+    ss = st.session_state
+    if ss.get('read_key') == (h, mode):
+        return  # same photo and mode already read: never reprocess on rerun
+    status = st.status('Reading photo...', expanded=True)
+    try:
+        stop = fr.make_stop_fn(fleet, kind)
+        res = ir.process(img, mode, stop, status.write)
+        status.write('Matching fleet records')
+        with utils.timed('fleet_match'):
+            matches = fr.find_candidates(fleet, res.candidates[:60], kind)
+        status.update(label='Done', state='complete', expanded=False)
+    except Exception:
+        log.exception('read failed')
+        status.update(label='Failed', state='error')
+        st.error('Camera image could not be processed.')
+        return
+    ss.update(read_key=(h, mode), matches=matches, searched=True, ocr_conf=res.confidence,
+              photo_raw=ss.get('photo_raw'), sel_nonce=ss.get('sel_nonce', 0) + 1)
+    ss['value_input'] = res.candidates[0] if res.candidates else ''
+    notes = []
+    if not res.candidates:
+        notes.append('No reliable characters were detected. Move closer, clean the surface, or retry with/without flash.')
+    if res.timed_out:
+        notes.append('Time limit reached; showing the best candidates found. Correct manually if needed.')
+    ss['notice'] = ' '.join(notes)
+
+
+def card(c):
+    r, e = c['record'], html.escape
+    rows = [('VIN', r['_vin']), ('Plate', r['_plate']), ('Unit', r['_unit']),
+            ('Make / model', f"{r['_make']} {r['_model']}".strip()), ('Year', r['_year']),
+            ('Fleet owner', r['_owner']), ('Branch', r['_branch']), ('Location', r['_location']),
+            ('Status', r['_status']), ('Confidence', f"{c['confidence']:.0%}"), ('Match reason', c['reason'])]
+    return '<div class="card">' + '<br>'.join(f'<b>{k}:</b> {e(v) or "-"}' for k, v in rows) + '</div>'
+
+
+def scan_tab(user, fleet, storage, repo, required_actions):
+    ss = st.session_state
+    ss.setdefault('cam_n', 0)
+    if ss.get('flash'):
+        st.success(ss.pop('flash'))
+    mode = st.segmented_control('Scan type', MODES, default='Plate', key='mode') or 'Plate'
+    kind = 'VIN' if mode.startswith('VIN') else 'Plate'
+    n = ss['cam_n']
+    cam = st.camera_input('Take photo', key=f'cam_{n}')
+    with st.expander('Upload existing photo instead'):
+        up = st.file_uploader('Choose image', type=['jpg', 'jpeg', 'png', 'webp'], key=f'up_{n}',
+                              label_visibility='collapsed')
+    f = cam or up
+    raw = f.getvalue() if f is not None else ss.get('photo_raw')
+    img, h = None, ''
+    if raw:
+        h, img, err = get_image(raw)
+        if img is None:
+            st.error('Camera image could not be processed. ' + err)
         else:
-            out += re.findall(r'[A-Z]?\d{2,6}[A-Z]?',c)
-    return list(dict.fromkeys(out))
-def assisted(lines,kind):
-    if fleet.empty:return []
-    known=[x for x in fleet['_vin' if kind=='VIN' else '_plate'].dropna().astype(str).unique() if (len(x)==17 if kind=='VIN' else 2<=len(x)<=12)]
-    obs=direct_candidates(lines,kind)+[(vin(x) if kind=='VIN' else plate(x)) for x in lines]
-    scores={}
-    for x in obs:
-        if len(x)<(7 if kind=='VIN' else 2):continue
-        for k in difflib.get_close_matches(x,known,n=5,cutoff=.62 if kind=='Plate' else .67):scores[k]=max(scores.get(k,0),difflib.SequenceMatcher(None,x,k).ratio())
-    return [k for k,_ in sorted(scores.items(),key=lambda z:z[1],reverse=True)[:12]]
-def search(q,kind):
-    if fleet.empty:return pd.DataFrame(),'',''
-    col='_vin' if kind=='VIN' else '_plate';n=vin(q) if kind=='VIN' else plate(q);m=fleet[fleet[col]==n].copy();method='Exact '+kind
-    if m.empty and kind=='VIN' and len(n)>=8:m=fleet[fleet[col].str.endswith(n[-8:],na=False)].copy();method='VIN last 8'
-    if m.empty and kind=='Plate' and len(n)>=2:m=fleet[fleet[col].str.contains(re.escape(n),na=False)].copy();method='Partial plate'
-    if m.empty:return m,'',''
-    owners=set(m['_owner']);owner='Moov' if 'Moov' in owners else ('Hertz' if 'Hertz' in owners else 'AFF');return m[m['_owner']==owner].copy(),method,owner
+            ss['photo_raw'] = raw
+            st.image(img, width='stretch')
+    if mode != 'Manual':
+        needs = ir.barcode_available() if mode == 'VIN barcode / QR' else ir.ocr_available()
+        if not needs and not ir.ocr_available():
+            box('warn', 'Text reader is not available on this server. Use Manual mode.')
+        if st.button('Read photo', type='primary', width='stretch', disabled=img is None):
+            run_read(img, h, mode, kind, fleet)
+    if st.button('Retake / reset', width='stretch'):
+        reset_scan()
+        st.rerun()
+    if ss.get('notice'):
+        box('warn', html.escape(ss['notice']))
 
-def save(r):
-    init_db()
-    with sqlite3.connect(DB, timeout=30) as c:
-        c.execute('PRAGMA busy_timeout=30000')
-        c.execute('INSERT INTO scan_log('+','.join(r)+') VALUES('+','.join('?'*len(r))+')',tuple(r.values()))
-        c.commit()
+    value = st.text_input('Confirm or correct ' + kind, key='value_input')
+    if st.button('Find vehicle', type='primary', width='stretch', disabled=not value.strip()):
+        ss.update(matches=fr.find_candidates(fleet, [value], kind, manual=True), searched=True,
+                  sel_nonce=ss.get('sel_nonce', 0) + 1)
+    if not ss.get('searched'):
+        return
 
-scan_tab,history_tab,status_tab=st.tabs(['📷 Scan','🧾 History','⚙️ Status'])
-with scan_tab:
-    if missing:st.warning('Some repository files are missing. Check Status.')
-    mode=st.segmented_control('Scan type',['Plate','VIN label','VIN barcode / QR','Manual'],default='Plate',selection_mode='single')
-    kind='VIN' if mode and mode.startswith('VIN') else 'Plate'
-    image_file=None
-    if mode!='Manual':
-        image_file=st.camera_input('Take photo',key='camera')
-        with st.expander('Upload existing photo instead'):
-            up=st.file_uploader('Choose image',type=['jpg','jpeg','png','webp'],label_visibility='collapsed');image_file=image_file or up
-        st.caption('Keep the camera parallel. Make the plate or VIN fill at least one-third of the image. For glass, try once with flash and once without.')
-    if image_file:
-        image=Image.open(io.BytesIO(image_file.getvalue())).convert('RGB');st.image(image,width='stretch')
-        if st.button('Read photo',type='primary'):
-            with st.spinner('Enhancing, rotating, reading and matching against fleet data...'):
-                raw=barcode_read(image) if mode=='VIN barcode / QR' else ocr_read(image,kind)
-                candidates=list(dict.fromkeys(assisted(raw,kind)+direct_candidates(raw,kind)+raw))[:30]
-                st.session_state.candidates=candidates;st.session_state.detected=candidates[0] if candidates else ''
-            if not candidates:st.error('No reliable text found. Move closer, clean the glass or plate, and try one photo with flash and one without.')
-    cs=st.session_state.get('candidates',[])
-    if cs:st.session_state.detected=st.selectbox('Best detected matches',cs)
-    value=st.text_input('Confirm or correct '+kind,value=st.session_state.get('detected',''))
-    if st.button('Find vehicle',type='primary',disabled=not value.strip()):st.session_state.lookup=(value,kind)
-    if 'lookup' in st.session_state:
-        q,k=st.session_state.lookup;m,method,owner=search(q,k)
-        if m.empty:
-            st.markdown('<div class="bad"><b>No fleet match found.</b> Correct the value or save as unmatched.</div>',unsafe_allow_html=True);row={x:'' for x in ['_vin','_plate','_unit','_make','_model','_year','_branch','_location','_status','_file']};owner='Unmatched'
-        else:
-            labels=[f"{txt(r['_plate']) or '-'} | {txt(r['_vin']) or '-'} | {txt(r['_make'])} {txt(r['_model'])}" for _,r in m.iterrows()];row=m.iloc[labels.index(st.selectbox('Confirm vehicle',labels))]
-            st.markdown(f'<div class="ok"><b>{owner} vehicle found</b><br>{txt(row["_make"])} {txt(row["_model"])} · {txt(row["_plate"])} · {txt(row["_vin"])}</div>',unsafe_allow_html=True)
-        with st.form('save_form'):
-            c1,c2=st.columns(2);user=c1.text_input('Scanned by');action=c2.selectbox('Action',ACTIONS)
-            cv=st.text_input('Confirmed VIN',value=txt(row['_vin']) if not m.empty else (vin(q) if k=='VIN' else ''));cp=st.text_input('Confirmed plate',value=txt(row['_plate']) if not m.empty else (q if k=='Plate' else ''))
-            loc=st.text_input('Location',value=txt(row['_location']));notes=st.text_area('Notes')
-            if st.form_submit_button('Confirm and save',type='primary',disabled=not user.strip()):
-                save({'scanned_on':datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'scanned_by':user,'action':action,'scan_type':mode,'scanned_value':q,'confirmed_vin':vin(cv),'confirmed_plate':cp,'owner':owner,'unit':txt(row['_unit']),'make':txt(row['_make']),'model':txt(row['_model']),'year':txt(row['_year']),'branch':txt(row['_branch']),'location':loc,'status':txt(row['_status']),'match_method':method,'source_file':txt(row['_file']),'notes':notes});st.success('Saved. Ready for the next vehicle.');st.session_state.pop('lookup',None);st.session_state.candidates=[];st.session_state.detected=''
-with history_tab:
-    st.caption('History is loaded only when requested so the scanner opens faster.')
-    if st.button('Load scan history'):
-        st.session_state.show_history=True
-    if st.session_state.get('show_history'):
-        log=read_scan_log()
-        term=st.text_input('Search history')
-        if term and not log.empty:
-            mask=pd.Series(False,index=log.index)
-            for c in log.columns:mask|=log[c].fillna('').astype(str).str.contains(re.escape(term),case=False,na=False)
-            log=log[mask]
-        st.dataframe(log,width='stretch',hide_index=True)
-        if not log.empty:
-            out=io.BytesIO()
-            with pd.ExcelWriter(out,engine='openpyxl') as w:log.to_excel(w,index=False)
-            st.download_button('Download Excel',out.getvalue(),'fleet_scan_log.xlsx',width='stretch')
-with status_tab:
-    st.subheader('Repository data status')
-    st.write(('✅' if INDEX_FILE not in missing else '❌')+f' **Fast fleet index:** {INDEX_FILE}')
-    st.metric('Loaded vehicle rows',f'{len(fleet):,}')
-    st.caption('Ownership priority: Moov when a VIN exists in both Moov and Hertz; otherwise Hertz or AFF.')
+    matches, nonce = ss.get('matches', []), ss.get('sel_nonce', 0)
+    rec, owner, conf, reason = {f: '' for f in fr.FIELDS}, 'Unmatched', None, 'Unmatched'
+    if not matches:
+        box('bad', '<b>No fleet match found.</b> Correct the value above or save as unmatched.')
+    else:
+        top = fr.band(matches[0]['confidence'])
+        box({'strong': 'ok', 'likely': 'warn', 'low': 'bad'}[top],
+            {'strong': '<b>Strong match.</b> Please confirm it is the right vehicle.',
+             'likely': '<b>Likely match.</b> Check the candidates below.',
+             'low': '<b>Low confidence.</b> Select a vehicle manually or correct the value.'}[top])
+        for c in matches:
+            st.markdown(card(c), unsafe_allow_html=True)
+        labels = [f"{i + 1}. {c['record']['_plate'] or '-'} | {c['record']['_vin'] or '-'} | {c['confidence']:.0%}"
+                  for i, c in enumerate(matches)]
+        choice = st.radio('Confirm vehicle', labels + [UNMATCHED], key=f'choice_{nonce}',
+                          index=0 if top == 'strong' else None)
+        if choice is None:
+            st.info('Select a vehicle or "Not in fleet" to continue.')
+            return
+        if choice != UNMATCHED:
+            sel = matches[labels.index(choice)]
+            rec, owner, conf, reason = sel['record'], sel['owner'], sel['confidence'], sel['reason']
+
+    q = ss.get('value_input', '')
+    with st.form('save_form'):
+        action = st.selectbox('Action', ACTIONS)
+        cv = st.text_input('Confirmed VIN', value=rec['_vin'] or (utils.norm_vin(q) if kind == 'VIN' else ''),
+                           key=f'cv_{nonce}_{rec["_vin"]}')
+        cp = st.text_input('Confirmed plate', value=rec['_plate'] or (utils.norm_plate(q) if kind == 'Plate' else ''),
+                           key=f'cp_{nonce}_{rec["_plate"]}')
+        loc = st.text_input('Location', value=rec['_location'], key=f'loc_{nonce}_{rec["_vin"]}')
+        notes = st.text_area('Notes', key=f'notes_{nonce}')
+        st.caption('Stock Count requires a photo that is stored successfully.')
+        go = st.form_submit_button('Confirm and save', type='primary', width='stretch')
+    if go:
+        save_scan(user, fleet, storage, repo, required_actions, mode, kind, action, q, utils.norm_vin(cv),
+                  cp, loc, notes, rec, owner, reason, conf)
+
+
+def save_scan(user, fleet, storage, repo, required_actions, mode, kind, action, query, vin, plate, loc,
+              notes, rec, owner, reason, conf):
+    ss = st.session_state
+    raw = ss.get('photo_raw')
+    err = utils.validate_save(action, bool(raw), required_actions)
+    if err:
+        st.error(err)
+        return
+    if repo is None:
+        st.error('Scan log is temporarily unavailable.')
+        return
+    if vin and vin != rec['_vin']:  # the confirmed VIN decides ownership, not raw OCR
+        owner = fr.owner_for_vin(fleet, vin) or owner
+    photo = {'photo_file_name': '', 'photo_folder': '', 'photo_url': '', 'photo_status': 'not_attempted'}
+    must = utils.photo_required(action, required_actions)
+    if raw and (must or storage.configured):
+        h = utils.image_hash(raw)
+        done = ss.setdefault('uploads', {})
+        if h not in done:  # an earlier successful upload is reused on retry (no duplicates)
+            try:
+                jpg = utils.prepare_photo(raw)
+            except ValueError:
+                st.error('Camera image could not be processed.')
+                return
+            when = utils.now_dubai()
+            name = utils.photo_file_name(when, vin, plate, kind)
+            with st.spinner('Uploading photo...'), utils.timed('photo_upload'):
+                res = storage.upload_photo(user['username'], name, jpg, {'when': when})
+            if res.ok:
+                done[h] = res
+            elif must:
+                st.error(('Photo storage not configured. ' if 'not configured' in res.message else '')
+                         + 'Photo upload failed. The stock count was not saved. Press Confirm and save to retry; your photo is kept.')
+                return
+            else:
+                st.warning('Photo could not be stored; the scan was saved without it.')
+                photo['photo_status'] = 'failed'
+        if h in done:
+            r = done[h]
+            photo = {'photo_file_name': r.file_name, 'photo_folder': r.folder_path,
+                     'photo_url': r.url, 'photo_status': 'uploaded'}
+    record = {
+        'scan_id': uuid.uuid4().hex, 'username': user['username'], 'display_name': user['display_name'],
+        'login_time': ss.get('login_time', ''), 'scanned_on': utils.now_dubai().strftime('%Y-%m-%d %H:%M:%S'),
+        'scanned_by': user['display_name'], 'action': action, 'scan_type': mode, 'scanned_value': query,
+        'confirmed_vin': vin, 'confirmed_plate': plate, 'owner': owner, 'unit': rec['_unit'],
+        'make': rec['_make'], 'model': rec['_model'], 'year': rec['_year'], 'branch': rec['_branch'],
+        'location': loc, 'status': rec['_status'], 'match_method': reason, 'match_confidence': conf,
+        'ocr_confidence': ss.get('ocr_conf'), 'source_file': rec['_file'], 'notes': notes, **photo}
+    try:
+        with utils.timed('db_save'):
+            repo.add(record)
+    except Exception:
+        log.exception('scan save failed')
+        st.error('Scan log is temporarily unavailable. Press Confirm and save to retry; the photo will not be uploaded twice.')
+        return
+    ss['flash'] = 'Saved. Ready for the next vehicle.'
+    reset_scan()
+    st.rerun()
+
+
+# ------------------------------------------------------------------ history / admin
+def history_tab(repo, user, everyone=False):
+    key = 'all' if everyone else 'mine'
+    if everyone and user['role'] != 'admin':
+        return
+    if repo is None:
+        st.error('Scan log is temporarily unavailable.')
+        return
+    st.caption('History is loaded on request. SQLite history is not permanent on Streamlit Community Cloud.')
+    if st.button('Load history', key=f'load_{key}', width='stretch'):
+        st.session_state[f'show_{key}'] = True
+    if not st.session_state.get(f'show_{key}'):
+        return
+    try:
+        df = repo.history(None if everyone else user['username'])
+    except Exception:
+        log.exception('history failed')
+        st.error('Scan log is temporarily unavailable.')
+        return
+    if everyone and not df.empty:
+        who = st.selectbox('Employee', ['All'] + sorted(df['username'].dropna().unique().tolist()), key='emp_filter')
+        if who != 'All':
+            df = df[df['username'] == who]
+    term = st.text_input('Search history', key=f'term_{key}')
+    if term and not df.empty:
+        mask = pd.Series(False, index=df.index)
+        for c in df.columns:
+            mask |= df[c].fillna('').astype(str).str.contains(re.escape(term), case=False, na=False)
+        df = df[mask]
+    st.dataframe(df, width='stretch', hide_index=True)
+    if not df.empty:
+        st.download_button('Download Excel', to_excel(df), f'fleet_scan_{key}.xlsx', width='stretch', key=f'dl_{key}')
+
+
+def status_tab(fleet, ferr, storage):
+    st.write(('✅' if not ferr else '❌') + f' **Fleet index:** {INDEX_FILE} ({len(fleet):,} vehicle rows)')
+    if ferr:
+        st.error(ferr)
+    if storage.configured:
+        st.write(f'✅ **Photo storage:** {storage.name}')
+        if not storage.persistent:
+            st.warning('Local photo storage is for development only and is lost on Streamlit Cloud restarts.')
+    else:
+        st.write('⚠️ **Photo storage not configured.** Scanning works; Stock Count saves are blocked until it is set up.')
+    st.caption('Ownership: Moov when a VIN exists in both Moov and Hertz; otherwise Hertz, then AFF.')
+
+
+def admin_tab(fleet, ferr, storage, repo, users):
+    st.write(f'**Version:** {utils.APP_VERSION}')
+    st.write(('✅' if not ferr else '❌') + f' Fleet index loaded - {len(fleet):,} rows')
+    if not fleet.empty:
+        st.write(fleet['_owner'].value_counts().to_dict())
+    st.write(('✅' if ir.ocr_available() else '❌') + ' Tesseract OCR executable')
+    st.write(('✅' if ir.barcode_available() else '❌') + ' Barcode library (zxing-cpp)')
+    st.write(('✅' if storage.configured else '⚠️') + f' Storage provider: {storage.name}')
+    if st.button('Run storage and database health checks', width='stretch'):
+        ok, msg = storage.health_check()
+        st.write(('✅ ' if ok else '❌ ') + 'Storage: ' + msg)
+        ok, msg = repo.health() if repo else (False, 'Scan log unavailable')
+        st.write(('✅ ' if ok else '❌ ') + 'Database: ' + msg)
+    st.write('**Users:** ' + ', '.join(f"{u['username']} ({u['role']}{'' if u['active'] else ', inactive'})" for u in users.values()))
+
+
+# ------------------------------------------------------------------ main
+secrets = secrets_dict()
+users = auth.load_users(secrets)
+if not auth.is_authenticated(st.session_state):
+    login_page(users)
+    st.stop()
+
+user = {k: st.session_state[k] for k in ('username', 'display_name', 'role')}
+fleet, ferr = cached_fleet(os.path.join(HERE, INDEX_FILE))
+storage, repo = get_storage(), get_repo()
+required_actions = set(secrets.get('storage', {}).get('photo_required_actions', [])) | {'Stock Count'}
+
+fleet_txt = f'🟢 Fleet {len(fleet):,}' if not ferr else '🔴 Fleet index missing'
+photo_txt = '📷 Photos ready' if storage.configured else '📷 Photo storage not configured'
+st.markdown(f'<div class="hero"><h1>Fleet Scan</h1><p>{html.escape(user["display_name"])} · {user["role"]}'
+            f'<br>{fleet_txt} · {photo_txt}</p></div>', unsafe_allow_html=True)
+if st.button('Logout', width='stretch'):
+    auth.logout(st.session_state)
+    st.rerun()
+if ferr:
+    st.error(ferr)
+
+names = ['Scan', 'My History', 'Status'] + (['All History', 'Administration'] if user['role'] == 'admin' else [])
+tabs = st.tabs(names)
+with tabs[0]:
+    scan_tab(user, fleet, storage, repo, required_actions)
+with tabs[1]:
+    history_tab(repo, user)
+with tabs[2]:
+    status_tab(fleet, ferr, storage)
+if user['role'] == 'admin':
+    with tabs[3]:
+        history_tab(repo, user, everyone=True)
+    with tabs[4]:
+        admin_tab(fleet, ferr, storage, repo, users)
