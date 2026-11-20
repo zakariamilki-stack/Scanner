@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 import auth
+from camera_component import frame_camera
 import fleet_repository as fr
 import image_reader as ir
 import photo_storage as ps
@@ -103,9 +104,15 @@ def login_page(users):
 # ------------------------------------------------------------------ scan
 def reset_scan():
     n = st.session_state.get('cam_n', 0) + 1
-    for k in ('matches', 'searched', 'read_key', 'ocr_conf', 'photo_raw', 'value_input', 'notice'):
+    for k in ('matches', 'searched', 'read_key', 'ocr_conf', 'photo_raw', 'photo_framed', 'basic_seen',
+              'value_input', 'notice'):
         st.session_state.pop(k, None)
     st.session_state['cam_n'] = n
+
+
+def clear_results():
+    for k in ('matches', 'searched', 'read_key', 'ocr_conf', 'notice'):
+        st.session_state.pop(k, None)
 
 
 def get_image(raw):
@@ -129,7 +136,7 @@ def run_read(img, h, mode, kind, fleet):
     status = st.status('Reading photo...', expanded=True)
     try:
         stop = fr.make_stop_fn(fleet, kind)
-        res = ir.process(img, mode, stop, status.write)
+        res = ir.process(img, mode, stop, status.write, framed=bool(ss.get('photo_framed')))
         status.write('Matching fleet records')
         with utils.timed('fleet_match'):
             matches = fr.find_candidates(fleet, res.candidates[:60], kind)
@@ -167,12 +174,23 @@ def scan_tab(user, fleet, storage, repo, required_actions):
     mode = st.segmented_control('Scan type', MODES, default='Plate', key='mode') or 'Plate'
     kind = 'VIN' if mode.startswith('VIN') else 'Plate'
     n = ss['cam_n']
-    cam = st.camera_input('Take photo', key=f'cam_{n}')
-    with st.expander('Upload existing photo instead'):
+    if mode != 'Manual':  # live camera with a guide frame; the browser crops to the frame
+        shot = frame_camera(kind, n)
+        if shot and shot['id'] != ss.get('cam_seen'):
+            ss['cam_seen'] = shot['id']
+            ss['photo_raw'], ss['photo_framed'] = shot['bytes'], True
+            clear_results()
+    with st.expander('Basic camera or upload instead'):
+        cam = st.camera_input('Take photo', key=f'cam_{n}')
         up = st.file_uploader('Choose image', type=['jpg', 'jpeg', 'png', 'webp'], key=f'up_{n}',
                               label_visibility='collapsed')
     f = cam or up
-    raw = f.getvalue() if f is not None else ss.get('photo_raw')
+    if f is not None:
+        b = f.getvalue()
+        if utils.image_hash(b) != ss.get('basic_seen'):
+            ss['basic_seen'], ss['photo_raw'], ss['photo_framed'] = utils.image_hash(b), b, False
+            clear_results()
+    raw = ss.get('photo_raw')
     img, h = None, ''
     if raw:
         h, img, err = get_image(raw)
@@ -232,7 +250,8 @@ def scan_tab(user, fleet, storage, repo, required_actions):
                            key=f'cp_{nonce}_{rec["_plate"]}')
         loc = st.text_input('Location', value=rec['_location'], key=f'loc_{nonce}_{rec["_vin"]}')
         notes = st.text_area('Notes', key=f'notes_{nonce}')
-        st.caption('Stock Count requires a photo that is stored successfully.')
+        st.caption('Stock Count requires a photo that is stored successfully.' if storage.configured
+                   else 'Photos are not stored in this version. The scan record is saved.')
         go = st.form_submit_button('Confirm and save', type='primary', width='stretch')
     if go:
         save_scan(user, fleet, storage, repo, required_actions, mode, kind, action, q, utils.norm_vin(cv),
@@ -252,7 +271,8 @@ def save_scan(user, fleet, storage, repo, required_actions, mode, kind, action, 
         return
     if vin and vin != rec['_vin']:  # the confirmed VIN decides ownership, not raw OCR
         owner = fr.owner_for_vin(fleet, vin) or owner
-    photo = {'photo_file_name': '', 'photo_folder': '', 'photo_url': '', 'photo_status': 'not_attempted'}
+    photo = {'photo_file_name': '', 'photo_folder': '', 'photo_url': '',
+             'photo_status': 'not_attempted' if storage.configured else 'not_stored'}
     must = utils.photo_required(action, required_actions)
     if raw and (must or storage.configured):
         h = utils.image_hash(raw)
@@ -343,7 +363,7 @@ def status_tab(fleet, ferr, storage):
         if not storage.persistent:
             st.warning('Local photo storage is for development only and is lost on Streamlit Cloud restarts.')
     else:
-        st.write('⚠️ **Photo storage not configured.** Scanning works; Stock Count saves are blocked until it is set up.')
+        st.write('📷 **Photo storage is off.** Scan records are saved without photos.')
     st.caption('Ownership: Moov when a VIN exists in both Moov and Hertz; otherwise Hertz, then AFF.')
 
 
@@ -373,10 +393,11 @@ if not auth.is_authenticated(st.session_state):
 user = {k: st.session_state[k] for k in ('username', 'display_name', 'role')}
 fleet, ferr = cached_fleet(os.path.join(HERE, INDEX_FILE))
 storage, repo = get_storage(), get_repo()
-required_actions = set(secrets.get('storage', {}).get('photo_required_actions', [])) | {'Stock Count'}
+required_actions = (set(secrets.get('storage', {}).get('photo_required_actions', [])) | {'Stock Count'}
+                    if storage.configured else set())
 
 fleet_txt = f'🟢 Fleet {len(fleet):,}' if not ferr else '🔴 Fleet index missing'
-photo_txt = '📷 Photos ready' if storage.configured else '📷 Photo storage not configured'
+photo_txt = '📷 Photos ready' if storage.configured else '📷 Photos off (scan log only)'
 st.markdown(f'<div class="hero"><h1>Fleet Scan</h1><p>{html.escape(user["display_name"])} · {user["role"]}'
             f'<br>{fleet_txt} · {photo_txt}</p></div>', unsafe_allow_html=True)
 if st.button('Logout', width='stretch'):
