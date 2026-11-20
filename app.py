@@ -181,9 +181,9 @@ def scan_tab(user, fleet, storage, repo, required_actions):
             ss['photo_raw'], ss['photo_framed'] = shot['bytes'], True
             clear_results()
     with st.expander('Basic camera or upload instead'):
-        cam = st.camera_input('Take photo', key=f'cam_{n}')
-        up = st.file_uploader('Choose image', type=['jpg', 'jpeg', 'png', 'webp'], key=f'up_{n}',
-                              label_visibility='collapsed')
+        use_basic = st.toggle('Use the basic camera', key=f'basic_{n}')
+        cam = st.camera_input('Take photo', key=f'cam_{n}') if use_basic else None
+                              
     f = cam or up
     if f is not None:
         b = f.getvalue()
