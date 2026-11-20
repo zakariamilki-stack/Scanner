@@ -49,7 +49,7 @@ class PhotoStorageProvider:
 
 
 class NotConfiguredProvider(PhotoStorageProvider):
-    name = 'not configured'
+    name = 'off (scan log only)'
 
     def ensure_user_folder(self, username):
         return self.user_folder(username)
