@@ -87,7 +87,7 @@ def photo_file_name(when, vin='', plate='', kind='PLATE'):
 
 
 def photo_required(action, required_actions=DEFAULT_PHOTO_ACTIONS):
-    return action in set(required_actions) | {'Stock Count'}
+    return action in set(required_actions)
 
 
 def validate_save(action, has_photo, required_actions=DEFAULT_PHOTO_ACTIONS):
