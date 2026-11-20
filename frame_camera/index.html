@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;padding:0;background:transparent;font-family:Inter,system-ui,sans-serif}
+#wrap{position:relative;width:100%;height:440px;background:#05101f;border-radius:16px;overflow:hidden}
+video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#frame{position:absolute;box-sizing:border-box;border:4px solid #2ea0ff;border-radius:14px;box-shadow:0 0 0 9999px rgba(3,12,28,.58);pointer-events:none}
+#hint{position:absolute;left:0;right:0;top:12px;text-align:center;font-size:15px;font-weight:700;color:#fff;text-shadow:0 1px 4px #000}
+#row{display:flex;gap:10px;margin-top:10px}
+button{min-height:54px;border:0;border-radius:12px;font-size:18px;font-weight:700;background:#0876cf;color:#fff;cursor:pointer}
+button#cap{flex:1}button.sec{background:#e1e9f3;color:#0b1f3a;padding:0 16px}
+#zoomrow{display:none;margin-top:8px;color:#0b1f3a;font-size:14px;align-items:center;gap:10px}#zoomrow input{flex:1}
+#err{display:none;margin-top:8px;padding:12px;border-radius:10px;background:#ffe5e5;color:#6b0f0f;font-size:15px}
+#ok{display:none;margin-top:8px;padding:10px;border-radius:10px;background:#e3f6ea;color:#0b3d1a;font-size:15px;font-weight:600}
+#prev{display:none;width:100%;max-height:150px;object-fit:contain;margin-top:8px;border-radius:10px;background:#05101f}
+</style></head><body>
+<div id="wrap"><video id="v" autoplay muted playsinline></video><div id="frame"></div><div id="hint"></div></div>
+<div id="row"><button id="cap">📸 Capture</button><button class="sec" id="tall" title="Rotate frame">⟲ Frame</button><button class="sec" id="torch" style="display:none">🔦</button></div>
+<div id="zoomrow">Zoom <input type="range" id="zoom"></div>
+<div id="err"></div><div id="ok">✔ Captured. Tap “Read photo” below.</div><img id="prev" alt="captured">
+<script>
+const $=id=>document.getElementById(id);
+let args={kind:'Plate',reset:0},lastReset=null,track=null,tall=false,torchOn=false;
+const RATIO={Plate:3.2,VIN:5.5};
+function post(type,extra){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*');}
+function fit(){post('streamlit:setFrameHeight',{height:document.documentElement.scrollHeight+6});}
+function layout(){
+  const W=$('wrap').clientWidth,H=$('wrap').clientHeight;let r=RATIO[args.kind]||3.2;if(tall)r=1/r;
+  let w=W*.9,h=w/r;if(h>H*.8){h=H*.8;w=h*r;}if(w>W*.92){w=W*.92;h=w/r;}
+  Object.assign($('frame').style,{width:w+'px',height:h+'px',left:(W-w)/2+'px',top:(H-h)/2+'px'});
+  $('hint').textContent=args.kind==='VIN'?'Fit the VIN or barcode inside the frame':'Fit the plate inside the frame';
+}
+async function start(){
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false});
+    $('v').srcObject=s;await $('v').play();track=s.getVideoTracks()[0];
+    try{await track.applyConstraints({advanced:[{focusMode:'continuous'}]});}catch(e){}
+    const c=track.getCapabilities?track.getCapabilities():{};
+    if(c.zoom){const z=$('zoom');z.min=c.zoom.min;z.max=c.zoom.max;z.step=c.zoom.step||0.1;z.value=c.zoom.min;$('zoomrow').style.display='flex';
+      z.oninput=()=>track.applyConstraints({advanced:[{zoom:parseFloat(z.value)}]}).catch(()=>{});}
+    if(c.torch){$('torch').style.display='block';}
+  }catch(e){const m=$('err');m.style.display='block';m.textContent='Camera not available. Allow camera access in the browser, or use the basic camera below.';}
+  layout();fit();
+}
+$('torch').onclick=()=>{torchOn=!torchOn;track.applyConstraints({advanced:[{torch:torchOn}]}).catch(()=>{});};
+$('tall').onclick=()=>{tall=!tall;layout();};
+$('cap').onclick=()=>{
+  const v=$('v'),vw=v.videoWidth,vh=v.videoHeight;if(!vw)return;
+  const W=$('wrap').clientWidth,H=$('wrap').clientHeight,s=Math.max(W/vw,H/vh),ox=(vw*s-W)/2,oy=(vh*s-H)/2,f=$('frame');
+  const px=f.offsetWidth*.04/s,py=f.offsetHeight*.04/s;
+  let sx=(f.offsetLeft+ox)/s-px,sy=(f.offsetTop+oy)/s-py,sw=f.offsetWidth/s+2*px,sh=f.offsetHeight/s+2*py;
+  sx=Math.max(0,sx);sy=Math.max(0,sy);sw=Math.min(vw-sx,sw);sh=Math.min(vh-sy,sh);
+  const k=Math.min(1,1600/sw),c=document.createElement('canvas');c.width=Math.round(sw*k);c.height=Math.round(sh*k);
+  c.getContext('2d').drawImage(v,sx,sy,sw,sh,0,0,c.width,c.height);
+  const url=c.toDataURL('image/jpeg',0.92);
+  $('prev').src=url;$('prev').style.display='block';$('ok').style.display='block';fit();
+  post('streamlit:setComponentValue',{value:{id:Date.now()+'-'+Math.random().toString(36).slice(2),data:url},dataType:'json'});
+};
+window.addEventListener('message',e=>{
+  const d=e.data;if(!d||d.type!=='streamlit:render')return;
+  args=d.args||args;
+  if(lastReset!==null&&args.reset!==lastReset){$('prev').style.display='none';$('ok').style.display='none';}
+  lastReset=args.reset;layout();fit();
+});
+post('streamlit:componentReady',{apiVersion:1});
+start();
+</script></body></html>
