@@ -9,3 +9,5 @@ zxing-cpp>=2.2,<4
 bcrypt>=4.1,<6
 requests>=2.31,<3
 tzdata
+rapidocr>=3.0,<4
+onnxruntime>=1.20,<2
