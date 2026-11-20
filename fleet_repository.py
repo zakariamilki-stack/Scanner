@@ -166,3 +166,12 @@ def make_stop_fn(fleet, kind):
     plates = set(fleet['_plate'])
     digits = set(fleet['_pdigits']) | {d[-5:] for d in fleet['_pdigits'] if len(d) > 5}
     return lambda t: t in plates or (len(re.sub(r'\D', '', t)) >= 4 and re.sub(r'\D', '', t) in digits)
+
+
+def merge_matches(base, extra, tag):
+    """Combine candidate lists from two readers; keep the best score per vehicle, top 3."""
+    best = {m['key']: m for m in base}
+    for m in extra:
+        if m['key'] not in best or m['confidence'] > best[m['key']]['confidence']:
+            best[m['key']] = dict(m, reason=m['reason'] + f' ({tag})')
+    return sorted(best.values(), key=lambda m: m['confidence'], reverse=True)[:3]          
