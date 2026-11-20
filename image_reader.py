@@ -203,7 +203,7 @@ def plate_regions(rgb):
     scored = []
     for c in cnts:
         x, y, bw, bh = cv2.boundingRect(c)
-        if bh == 0 or not .004 * w * h <= bw * bh <= .5 * w * h or not 1.4 <= bw / bh <= 6.0:
+        if bh == 0 or not .004 * w * h <= bw * bh <= .5 * w * h or not 1.2 <= bw / bh <= 6.5:
             continue
         cy = y + bh / 2
         if cy < .4 * h or cy > .93 * h:
@@ -217,7 +217,7 @@ def plate_regions(rgb):
             o = _order_points(quad)
             wd = int(max(np.linalg.norm(o[0] - o[1]), np.linalg.norm(o[3] - o[2])))
             ht = int(max(np.linalg.norm(o[0] - o[3]), np.linalg.norm(o[1] - o[2])))
-            if wd > 40 and ht > 15 and 1.4 <= wd / ht <= 6.0:
+            if wd > 40 and ht > 15 and 1.2 <= wd / ht <= 6.5:
                 m = cv2.getPerspectiveTransform(o, np.array([[0, 0], [wd, 0], [wd, ht], [0, ht]], dtype='float32'))
                 crops.append(cv2.warpPerspective(rgb, m, (wd, ht)))
                 continue
@@ -227,37 +227,51 @@ def plate_regions(rgb):
     return crops
 
 
-def plate_images(crop):
+def plate_images(crop, invert=False):
+    """Enhanced + thresholded crops. invert adds white-on-red/green/grey category panels."""
     import cv2
     gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
     if gray.shape[1] < 600:
         s = min(3.0, 600 / gray.shape[1])
         gray = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
     enhanced = cv2.createCLAHE(2.5, (8, 8)).apply(gray)
-    return [enhanced, cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]]
+    otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    return [enhanced, otsu] + ([255 - otsu] if invert else [])
 
 
 def plate_tokens(strings):
-    """2-6 digits with an optional adjacent English letter; Arabic text is ignored."""
-    out = []
+    """Main number first. Abu Dhabi category (1-2 digits) and Dubai/other letter codes are optional.
+    Handles 'G77926', '5 24910', '90 21338', and a code letter printed apart from the number."""
+    direct, digits, letters = [], [], []
     for s in strings:
         c = re.sub(r'[^A-Z0-9]', '', s.upper())
-        if re.fullmatch(r'[A-Z]?\d{2,6}[A-Z]?', c) and not c.isdigit():
-            out.append(c)
-        out += re.findall(r'\d{2,6}', c)
-    out = list(dict.fromkeys(out))
-    return sorted(out, key=lambda t: 0 if len(re.sub(r'\D', '', t)) in (4, 5) else 1)
+        if not c:
+            continue
+        if re.fullmatch(r'[A-Z]', c):
+            if c not in letters:
+                letters.append(c)
+            continue
+        if re.fullmatch(r'[A-Z]{1,2}\d{2,5}|\d{2,5}[A-Z]{1,2}', c):
+            direct.append(c)
+        for run in re.findall(r'\d+', c):
+            cands = [run[-5:], run[-4:]] if len(run) > 6 else ([run, run[-5:]] if len(run) == 6 else [run])
+            digits += [d for d in cands if len(d) >= 2 and d not in digits]
+    digits.sort(key=lambda t: 0 if len(t) in (4, 5) else 1)
+    combos = [l + d for d in digits[:3] for l in letters[:3]]
+    return list(dict.fromkeys(direct + digits + combos))
 
 
-def read_plate_ocr(img, deadline, stop_when=None, progress=None):
+def read_plate_ocr(img, deadline, stop_when=None, progress=None, framed=False):
+    """framed=True: the photo was cropped to the on-screen guide frame, so read it whole first."""
     if progress:
         progress('Locating text region')
-    crops = plate_regions(np.array(img))
+    rgb = np.array(img)
+    crops = ([rgb] if framed else []) + plate_regions(rgb)
     if progress:
         progress('Reading characters')
     tokens, confs, done = [], [], False
-    for crop in crops:
-        for im in plate_images(crop):
+    for n, crop in enumerate(crops):
+        for im in plate_images(crop, invert=(n == 0)):
             if time.monotonic() >= deadline - .5:
                 done = True
                 break
@@ -277,7 +291,7 @@ def read_plate_ocr(img, deadline, stop_when=None, progress=None):
     return tokens, (max(confs) if confs else 0.0)
 
 
-def process(img, mode, stop_when=None, progress=None, timeout=TIMEOUT):
+def process(img, mode, stop_when=None, progress=None, timeout=TIMEOUT, framed=False):
     """Barcode first for VIN modes (stop on a valid VIN, skip OCR), then OCR. Hard time limit."""
     deadline = time.monotonic() + timeout
     say = progress or (lambda s: None)
@@ -299,7 +313,7 @@ def process(img, mode, stop_when=None, progress=None, timeout=TIMEOUT):
                 res.candidates = alts
         elif ocr_available():
             with timed('ocr_plate'):
-                res.candidates, res.confidence = read_plate_ocr(img, deadline, stop_when, say)
+                res.candidates, res.confidence = read_plate_ocr(img, deadline, stop_when, say, framed)
             res.source = 'ocr'
     except Exception:
         log.exception('image processing failed')
