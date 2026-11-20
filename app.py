@@ -14,6 +14,7 @@ import auth
 from camera_component import frame_camera
 import fleet_repository as fr
 import image_reader as ir
+import local_reader
 import photo_storage as ps
 import utils
 from scan_repository import SQLiteScanRepository
@@ -130,13 +131,8 @@ def get_image(raw):
     return h, img, ''
 
 
-def merge_matches(base, ai):
-    best = {m['key']: m for m in base}
-    for m in ai:
-        m = dict(m, reason=m['reason'] + ' (AI-assisted)')
-        if m['key'] not in best or m['confidence'] > best[m['key']]['confidence']:
-            best[m['key']] = m
-    return sorted(best.values(), key=lambda m: m['confidence'], reverse=True)[:3]
+def weak(matches):
+    return not matches or fr.band(matches[0]['confidence']) != 'strong'
 
 
 def run_read(img, h, mode, kind, fleet, ai_cfg=None):
@@ -150,15 +146,21 @@ def run_read(img, h, mode, kind, fleet, ai_cfg=None):
         status.write('Matching fleet records')
         with utils.timed('fleet_match'):
             matches = fr.find_candidates(fleet, res.candidates[:60], kind)
-        ai_cands = []
+        local_cands, ai_cands = [], []
+        if res.source != 'barcode' and weak(matches) and local_reader.available():
+            status.write('Second reader (free, runs on this server)')
+            with utils.timed('local_read'):
+                local_cands = local_reader.read_local(img, kind)
+            if local_cands:
+                matches = fr.merge_matches(matches, fr.find_candidates(fleet, local_cands[:60], kind), '2nd reader')
         if (ai_cfg and res.source != 'barcode' and ss.get('ai_calls', 0) < ai_reader.CALL_LIMIT
-                and (not matches or fr.band(matches[0]['confidence']) != 'strong')):
+                and weak(matches)):
             status.write('Double-checking with AI')
             ss['ai_calls'] = ss.get('ai_calls', 0) + 1
             with utils.timed('ai_read'):
                 ai_cands = ai_reader.read_with_ai(img, kind, ai_cfg)
             if ai_cands:
-                matches = merge_matches(matches, fr.find_candidates(fleet, ai_cands, kind))
+                matches = fr.merge_matches(matches, fr.find_candidates(fleet, ai_cands, kind), 'AI-assisted')
         status.update(label='Done', state='complete', expanded=False)
     except Exception:
         log.exception('read failed')
@@ -167,8 +169,11 @@ def run_read(img, h, mode, kind, fleet, ai_cfg=None):
         return
     ss.update(read_key=(h, mode), matches=matches, searched=True, ocr_conf=res.confidence,
               photo_raw=ss.get('photo_raw'), sel_nonce=ss.get('sel_nonce', 0) + 1)
-    all_cands = ai_cands + res.candidates
-    ss['value_input'] = all_cands[0] if all_cands else ''
+    all_cands = ai_cands + local_cands + res.candidates
+    if matches and matches[0]['confidence'] >= .8:
+        ss['value_input'] = matches[0]['record']['_vin' if kind == 'VIN' else '_plate']
+    else:
+        ss['value_input'] = all_cands[0] if all_cands else ''
     notes = []
     if not all_cands:
         notes.append('No reliable characters were detected. Move closer, clean the surface, or retry with/without flash.')
@@ -222,12 +227,12 @@ def scan_tab(user, fleet, storage, repo, required_actions, ai_cfg=None):
             st.image(img, width='stretch')
     if mode != 'Manual':
         needs = ir.barcode_available() if mode == 'VIN barcode / QR' else ir.ocr_available()
-        if not needs and not ir.ocr_available():
+        if not needs and not ir.ocr_available() and not local_reader.available():
             box('warn', 'Text reader is not available on this server. Use Manual mode.')
         if st.button('Read photo', type='primary', width='stretch', disabled=img is None):
             run_read(img, h, mode, kind, fleet, ai_cfg)
         if ai_cfg:
-            st.caption('If the text reader is unsure, the cropped photo is sent to an AI service for a second opinion.')
+            st.caption('If both readers are unsure, the cropped photo is sent to an AI service for a second opinion.')
     if st.button('Retake / reset', width='stretch'):
         reset_scan()
         st.rerun()
@@ -387,6 +392,7 @@ def status_tab(fleet, ferr, storage):
             st.warning('Local photo storage is for development only and is lost on Streamlit Cloud restarts.')
     else:
         st.write('📷 **Photo storage is off.** Scan records are saved without photos.')
+    st.write('🔎 **Free second reader:** ' + ('on' if local_reader.available() else 'off'))
     st.write('🤖 **AI backup reader:** ' + ('on' if ai_cfg else 'off'))
     st.caption('Ownership: Moov when a VIN exists in both Moov and Hertz; otherwise Hertz, then AFF.')
 
@@ -398,6 +404,7 @@ def admin_tab(fleet, ferr, storage, repo, users):
         st.write(fleet['_owner'].value_counts().to_dict())
     st.write(('✅' if ir.ocr_available() else '❌') + ' Tesseract OCR executable')
     st.write(('✅' if ir.barcode_available() else '❌') + ' Barcode library (zxing-cpp)')
+    st.write(('✅' if local_reader.available() else '❌') + ' Free second reader (RapidOCR)')
     st.write(('✅' if storage.configured else '⚠️') + f' Storage provider: {storage.name}')
     if st.button('Run storage and database health checks', width='stretch'):
         ok, msg = storage.health_check()
