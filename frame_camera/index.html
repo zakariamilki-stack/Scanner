@@ -23,7 +23,8 @@ const $=id=>document.getElementById(id);
 let args={kind:'Plate',reset:0},lastReset=null,track=null,tall=false,torchOn=false;
 const RATIO={Plate:3.2,VIN:5.5};
 function post(type,extra){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*');}
-function fit(){post('streamlit:setFrameHeight',{height:document.documentElement.scrollHeight+6});}
+let lastH=0;
+function fit(){const h=Math.ceil(document.body.getBoundingClientRect().height)+8;if(h!==lastH){lastH=h;post('streamlit:setFrameHeight',{height:h});}}
 function layout(){
   const W=$('wrap').clientWidth,H=$('wrap').clientHeight;let r=RATIO[args.kind]||3.2;if(tall)r=1/r;
   let w=W*.9,h=w/r;if(h>H*.8){h=H*.8;w=h*r;}if(w>W*.92){w=W*.92;h=w/r;}
