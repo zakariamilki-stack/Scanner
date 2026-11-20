@@ -39,6 +39,7 @@ async function start(){
     if(c.zoom){const z=$('zoom');z.min=c.zoom.min;z.max=c.zoom.max;z.step=c.zoom.step||0.1;z.value=c.zoom.min;$('zoomrow').style.display='flex';
       z.oninput=()=>track.applyConstraints({advanced:[{zoom:parseFloat(z.value)}]}).catch(()=>{});}
     if(c.torch){$('torch').style.display='block';}
+     setTimeout(()=>{const v=$('v');if(!v.videoWidth||v.readyState<2){const m=$('err');m.style.display='block';m.textContent='No camera picture. Close other apps or tabs using the camera and reload, or use the basic camera below.';fit();}},4000);
   }catch(e){const m=$('err');m.style.display='block';m.textContent='Camera not available. Allow camera access in the browser, or use the basic camera below.';}
   layout();fit();
 }
