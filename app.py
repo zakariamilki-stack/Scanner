@@ -183,7 +183,8 @@ def scan_tab(user, fleet, storage, repo, required_actions):
     with st.expander('Basic camera or upload instead'):
         use_basic = st.toggle('Use the basic camera', key=f'basic_{n}')
         cam = st.camera_input('Take photo', key=f'cam_{n}') if use_basic else None
-                              
+        up = st.file_uploader('Choose image', type=['jpg', 'jpeg', 'png', 'webp'], key=f'up_{n}',
+                              label_visibility='collapsed')                       
     f = cam or up
     if f is not None:
         b = f.getvalue()
