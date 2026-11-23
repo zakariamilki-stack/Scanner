@@ -86,7 +86,22 @@ def _digits_match(series, d):
     return m
 
 
-def find_candidates(fleet, observed, kind, manual=False, limit=3):
+def _emirate_pool(fleet, kind, emirate):
+    """Abu Dhabi plates have no English letters (category number + digits); Dubai plates have a letter code."""
+    if kind != 'Plate' or emirate not in ('AUH', 'DXB'):
+        return fleet
+    pool = fleet[fleet['_pletters'] == ''] if emirate == 'AUH' else fleet[fleet['_pletters'] != '']
+    return pool if len(pool) else fleet
+
+
+def find_candidates(fleet, observed, kind, manual=False, limit=3, emirate='Auto'):
+    """Search the emirate's plate style first; if nothing matches there, search the whole fleet."""
+    pool = _emirate_pool(fleet, kind, emirate)
+    out = _find(pool, observed, kind, manual, limit, full=fleet)
+    return out if out or pool is fleet else _find(fleet, observed, kind, manual, limit)
+
+
+def _find(fleet, observed, kind, manual=False, limit=3, full=None):
     """Ranked fleet candidates: dicts with key, confidence, reason, owner, record."""
     if fleet.empty:
         return []
@@ -144,7 +159,7 @@ def find_candidates(fleet, observed, kind, manual=False, limit=3):
 
     out, seen = [], set()
     for i, (conf, reason) in sorted(found.items(), key=lambda kv: kv[1][0], reverse=True):
-        rec = resolve_record(fleet, fleet.loc[i])
+          rec = resolve_record(full if full is not None else fleet, fleet.loc[i])
         key = rec['_vin'] or (rec['_plate'] + '|' + rec['_unit'])
         if key in seen:
             continue
