@@ -12,7 +12,8 @@ log = logging.getLogger('fleetscan')
 RENAME = {'vin': '_vin', 'plate': '_plate', 'unit': '_unit', 'make': '_make', 'model': '_model',
           'year': '_year', 'branch': '_branch', 'location': '_location', 'status': '_status',
           'km': '_km', 'owner': '_owner', 'source_file': '_file', 'source_sheet': '_sheet',
-          'priority': '_priority'}
+          'priority': '_priority', 'plate_emirate': '_emirate', 'plate_code': '_pcode',
+          'plate_number': '_pnum', 'vin_last5': '_vin5'}
 FIELDS = list(RENAME.values())
 OWNER_RANK = {'Moov': 0, 'Hertz': 1, 'AFF': 2}
 
@@ -25,8 +26,13 @@ def normalize_frame(df):
         df[c] = df[c].fillna('').astype(str).str.strip()
     df['_vin'] = df['_vin'].map(norm_vin)
     df['_plate'] = df['_plate'].map(norm_plate)
+    code, num = df['_pcode'].map(norm_plate), df['_pnum'].str.replace(r'\D', '', regex=True)
+    df['_plate'] = df['_plate'].where(df['_plate'] != '', code + num)  # build the plate from code + number
+    df['_emirate'] = df['_emirate'].str.upper()
     df['_pdigits'] = df['_plate'].str.replace(r'\D', '', regex=True)
     df['_pletters'] = df['_plate'].str.replace(r'[^A-Z]', '', regex=True)
+    df['_pnum'] = num.where(num != '', df['_pdigits'])
+    df['_vin5'] = df['_vin5'].map(norm_vin).where(df['_vin5'].map(norm_vin) != '', df['_vin'].str[-5:])
     return df[(df['_vin'] != '') | (df['_plate'] != '')].reset_index(drop=True)
 
 
@@ -79,18 +85,26 @@ def band(conf):
     return 'strong' if conf >= .95 else ('likely' if conf >= .80 else 'low')
 
 
-def _digits_match(series, d):
-    m = series == d
+def _digits_match(fleet, d):
+    m = (fleet['_pdigits'] == d) | (fleet['_pnum'] == d)
     if len(d) >= 4:
-        m = m | (series.str.endswith(d) & (series.str.len() - len(d) <= 2))
+        s = fleet['_pdigits']
+        m = m | (s.str.endswith(d) & (s.str.len() - len(d) <= 2))
     return m
 
 
 def _emirate_pool(fleet, kind, emirate):
-    """Abu Dhabi plates have no English letters (category number + digits); Dubai plates have a letter code."""
-    if kind != 'Plate' or emirate not in ('AUH', 'DXB'):
+    """Use the plate_emirate column when the data has it; otherwise infer AUH (no letters) / DXB (letter code)."""
+    if kind != 'Plate' or emirate == 'Auto':
         return fleet
-    pool = fleet[fleet['_pletters'] == ''] if emirate == 'AUH' else fleet[fleet['_pletters'] != '']
+    if (fleet['_emirate'] != '').any():
+        pool = fleet[fleet['_emirate'] == emirate]
+    elif emirate == 'AUH':
+        pool = fleet[fleet['_pletters'] == '']
+    elif emirate == 'DXB':
+        pool = fleet[fleet['_pletters'] != '']
+    else:
+        return fleet
     return pool if len(pool) else fleet
 
 
@@ -125,12 +139,26 @@ def _find(fleet, observed, kind, manual=False, limit=3, full=None):
                     if len(set(vins[idx])) == 1:
                         best = max(confidence(o, vins[idx[0]]), .85)
                         add(idx, best, 'Unique VIN last-eight match')
+
+        def last5(cands):
+            for o in cands:
+                idx = fleet.index[fleet['_vin5'] == o[-5:]]
+                n = len(set(vins[idx]))
+                if n == 1:
+                    add(idx, .85, 'Unique VIN last-five match')
+                elif 1 < n <= 6:
+                    add(idx, .70, 'VIN last-five match (choose one)')
+
+        if not found:
+            last5([o for o in obs if 5 <= len(o) < 8])  # the employee typed only the last digits
         if not found:
             known = [v for v in vins.unique() if v]
             for o in obs:
                 if len(o) >= 10:
                     for k in difflib.get_close_matches(o, known, n=3, cutoff=.7):
                         add(fleet.index[vins == k], confidence(o, k), 'Fleet-assisted OCR match')
+        if not found:
+            last5([o for o in obs if len(o) >= 8])  # tail of a long, partly misread VIN
     else:
         obs = [o for o in dict.fromkeys(norm_plate(x) for x in observed) if o]
         plates = fleet['_plate']
@@ -140,13 +168,13 @@ def _find(fleet, observed, kind, manual=False, limit=3, full=None):
             for o in obs:
                 d, letters = re.sub(r'\D', '', o), re.sub(r'[^A-Z]', '', o)
                 if d and letters:
-                    m = _digits_match(fleet['_pdigits'], d) & fleet['_pletters'].str.contains(letters, regex=False)
+                    m = _digits_match(fleet, d) & fleet['_pletters'].str.contains(letters, regex=False)
                     add(fleet.index[m], .96, 'Numeric plate match')
         if not found:
             for o in obs:
                 d = re.sub(r'\D', '', o)
                 if len(d) >= 2:
-                    idx = fleet.index[_digits_match(fleet['_pdigits'], d)]
+                    idx = fleet.index[_digits_match(fleet, d)]
                     if len(idx):
                         uniq = len(set(plates[idx])) == 1
                         add(idx, .88 if uniq else .70, 'Numeric plate match')
@@ -158,15 +186,16 @@ def _find(fleet, observed, kind, manual=False, limit=3, full=None):
                         add(fleet.index[plates == k], confidence(o, k), 'Fleet-assisted OCR match')
 
     out, seen = [], set()
+    cap = 6 if found and all('last-five' in r for _, r in found.values()) else limit
     for i, (conf, reason) in sorted(found.items(), key=lambda kv: kv[1][0], reverse=True):
-          rec = resolve_record(full if full is not None else fleet, fleet.loc[i])
+        rec = resolve_record(full if full is not None else fleet, fleet.loc[i])
         key = rec['_vin'] or (rec['_plate'] + '|' + rec['_unit'])
         if key in seen:
             continue
         seen.add(key)
         out.append({'key': key, 'confidence': conf, 'reason': reason,
                     'owner': rec['_owner'], 'record': {f: str(rec[f]) for f in FIELDS}})
-        if len(out) >= limit:
+        if len(out) >= cap:
             break
     return out
 
@@ -179,7 +208,7 @@ def make_stop_fn(fleet, kind):
         known = set(fleet['_vin'])
         return lambda v: v in known
     plates = set(fleet['_plate'])
-    digits = set(fleet['_pdigits']) | {d[-5:] for d in fleet['_pdigits'] if len(d) > 5}
+    digits = set(fleet['_pdigits']) | set(fleet['_pnum']) | {d[-5:] for d in fleet['_pdigits'] if len(d) > 5}
     return lambda t: t in plates or (len(re.sub(r'\D', '', t)) >= 4 and re.sub(r'\D', '', t) in digits)
 
 
@@ -189,4 +218,20 @@ def merge_matches(base, extra, tag):
     for m in extra:
         if m['key'] not in best or m['confidence'] > best[m['key']]['confidence']:
             best[m['key']] = dict(m, reason=m['reason'] + f' ({tag})')
-    return sorted(best.values(), key=lambda m: m['confidence'], reverse=True)[:3]          
+    return sorted(best.values(), key=lambda m: m['confidence'], reverse=True)[:3]
+
+
+def data_quality(fleet):
+    """Counts that help when cleaning fleet_index.csv."""
+    v = fleet['_vin']
+    has_vin, has_plate = fleet[v != ''], fleet[fleet['_plate'] != '']
+    return {
+        'rows': len(fleet),
+        'missing VIN': int((v == '').sum()),
+        'VIN not 17 valid characters': int(((v != '') & ~v.map(is_valid_vin)).sum()),
+        'missing plate': int((fleet['_plate'] == '').sum()),
+        'missing plate_emirate': int((fleet['_emirate'] == '').sum()),
+        'duplicate VIN + owner rows': int(has_vin.duplicated(['_vin', '_owner']).sum()),
+        'VINs listed under more than one owner': int((has_vin.groupby('_vin')['_owner'].nunique() > 1).sum()),
+        'plates shared by different VINs': int((has_plate.groupby('_plate')['_vin'].nunique() > 1).sum()),
+    }
