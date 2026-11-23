@@ -239,10 +239,10 @@ def plate_images(crop, invert=False):
     return [enhanced, otsu] + ([255 - otsu] if invert else [])
 
 
-def plate_tokens(strings):
-    """Main number first. Abu Dhabi category (1-2 digits) and Dubai/other letter codes are optional.
-    Handles 'G77926', '5 24910', '90 21338', and a code letter printed apart from the number."""
-    direct, digits, letters = [], [], []
+def plate_tokens(strings, emirate='Auto'):
+    """Main number first. Abu Dhabi (AUH) = category number + digits; other emirates = letter code + digits.
+    Handles 'G77926', '5 24910', '90 21338', and a code printed apart from the number."""
+    direct, digits, letters, smalls = [], [], [], []
     for s in strings:
         c = re.sub(r'[^A-Z0-9]', '', s.upper())
         if not c:
@@ -251,17 +251,24 @@ def plate_tokens(strings):
             if c not in letters:
                 letters.append(c)
             continue
+        if re.fullmatch(r'\d{1,2}', c) and c not in smalls:
+            smalls.append(c)
         if re.fullmatch(r'[A-Z]{1,2}\d{2,5}|\d{2,5}[A-Z]{1,2}', c):
             direct.append(c)
         for run in re.findall(r'\d+', c):
             cands = [run[-5:], run[-4:]] if len(run) > 6 else ([run, run[-5:]] if len(run) == 6 else [run])
             digits += [d for d in cands if len(d) >= 2 and d not in digits]
     digits.sort(key=lambda t: 0 if len(t) in (4, 5) else 1)
-    combos = [l + d for d in digits[:3] for l in letters[:3]]
-    return list(dict.fromkeys(direct + digits + combos))
+    letter_combos = [l + d for d in digits[:3] for l in letters[:3]]
+    cat_combos = [m + d for d in digits[:3] for m in smalls[:3] if m != d]
+    if emirate == 'AUH':
+        return list(dict.fromkeys(cat_combos + [d for d in direct if d.isdigit()] + digits))
+    if emirate != 'Auto':
+        return list(dict.fromkeys(direct + digits + letter_combos))
+    return list(dict.fromkeys(direct + digits + letter_combos + cat_combos))
 
 
-def read_plate_ocr(img, deadline, stop_when=None, progress=None, framed=False):
+def read_plate_ocr(img, deadline, stop_when=None, progress=None, framed=False, emirate='Auto'):
     """framed=True: the photo was cropped to the on-screen guide frame, so read it whole first."""
     if progress:
         progress('Locating text region')
@@ -281,7 +288,7 @@ def read_plate_ocr(img, deadline, stop_when=None, progress=None, framed=False):
                 log.warning('plate OCR attempt failed: %s', exc)
                 continue
             confs.append(conf)
-            found = plate_tokens(strings)
+            found = plate_tokens(strings, emirate)
             tokens += [t for t in found if t not in tokens]
             if stop_when and any(stop_when(t) for t in found):
                 done = True
@@ -291,7 +298,7 @@ def read_plate_ocr(img, deadline, stop_when=None, progress=None, framed=False):
     return tokens, (max(confs) if confs else 0.0)
 
 
-def process(img, mode, stop_when=None, progress=None, timeout=TIMEOUT, framed=False):
+def process(img, mode, stop_when=None, progress=None, timeout=TIMEOUT, framed=False, emirate='Auto'):
     """Barcode first for VIN modes (stop on a valid VIN, skip OCR), then OCR. Hard time limit."""
     deadline = time.monotonic() + timeout
     say = progress or (lambda s: None)
@@ -313,7 +320,7 @@ def process(img, mode, stop_when=None, progress=None, timeout=TIMEOUT, framed=Fa
                 res.candidates = alts
         elif ocr_available():
             with timed('ocr_plate'):
-                res.candidates, res.confidence = read_plate_ocr(img, deadline, stop_when, say, framed)
+                res.candidates, res.confidence = read_plate_ocr(img, deadline, stop_when, say, framed, emirate)
             res.source = 'ocr'
     except Exception:
         log.exception('image processing failed')
