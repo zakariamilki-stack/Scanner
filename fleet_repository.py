@@ -28,6 +28,31 @@ HEADER_ALIASES = {
 }
 
 
+def format_plate(rec):
+    """Display style: EMIRATE NUMBER CODE, e.g. 'AUH 17885 16'. Falls back to the raw plate."""
+    emirate = str(rec.get('_emirate', '')).strip().upper()
+    number = str(rec.get('_pnum', '')).strip()
+    code = str(rec.get('_pcode', '')).strip().upper()
+    if not number:
+        return str(rec.get('_plate', ''))
+    return ' '.join(p for p in (emirate, number, code) if p)
+
+
+_FMT_PLATE = re.compile(r'^\s*([A-Za-z]{3})\s+(\d+)\s*([A-Za-z0-9]{0,2})\s*$')
+
+
+def _expand_plate_inputs(observed):
+    """Also accept the display style ('AUH 17885 16') typed or pre-filled in the plate box."""
+    out = []
+    for x in observed:
+        out.append(x)
+        m = _FMT_PLATE.match(str(x))
+        if m:
+            out.append(m.group(3) + m.group(2))   # code + number, as stored in the fleet index
+            out.append(m.group(2))                # number only
+    return out
+
+
 def normalize_frame(df):
     df = df.rename(columns=RENAME).copy()
     for c in FIELDS:
@@ -91,24 +116,9 @@ def read_fleet_csv(path):
     return df
 
 
-def _locate_csv(path):
-    """Find the CSV even if the name has stray spaces/case or the working folder differs."""
-    import glob
-    if os.path.exists(path):
-        return path
-    here = os.path.dirname(os.path.abspath(__file__))
-    wanted = os.path.basename(path).replace(' ', '').lower()
-    for folder in (os.path.dirname(os.path.abspath(path)), here, os.getcwd()):
-        for f in glob.glob(os.path.join(folder, '*.csv')):
-            if os.path.basename(f).replace(' ', '').lower() == wanted:
-                return f
-    raise FileNotFoundError(
-        f'{path} not found. Looked in: {here} and {os.getcwd()}. '
-        f'Files there: {sorted(os.listdir(here))[:30]}')
-
-
 def load_index(path):
-    path = _locate_csv(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
     with timed('fleet_index_load'):
         df = normalize_frame(read_fleet_csv(path))
     if df.empty:
@@ -235,7 +245,7 @@ def _find(fleet, observed, kind, manual=False, limit=3, full=None):
         if not found:
             last5([o for o in obs if len(o) >= 8])  # tail of a long, partly misread VIN
     else:
-        obs = [o for o in dict.fromkeys(norm_plate(x) for x in observed) if o]
+        obs = [o for o in dict.fromkeys(norm_plate(x) for x in _expand_plate_inputs(observed)) if o]
         plates = fleet['_plate']
         for o in obs:
             add(fleet.index[plates == o], 1.0, 'Manual entry' if manual else 'Exact plate')
@@ -268,8 +278,11 @@ def _find(fleet, observed, kind, manual=False, limit=3, full=None):
         if key in seen:
             continue
         seen.add(key)
+        record = {f: str(rec[f]) for f in FIELDS}
+        record['_plate_raw'] = record['_plate']          # matching form, e.g. 1617885
+        record['_plate'] = format_plate(rec)             # display form, e.g. AUH 17885 16
         out.append({'key': key, 'confidence': conf, 'reason': reason,
-                    'owner': rec['_owner'], 'record': {f: str(rec[f]) for f in FIELDS}})
+                    'owner': rec['_owner'], 'record': record})
         if len(out) >= cap:
             break
     return out
