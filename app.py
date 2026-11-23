@@ -28,6 +28,7 @@ ACTIONS = ['Stock Count', 'Vehicle Received', 'Vehicle Moved', 'Inspection Compl
            'Vehicle Collected', 'Auction Preparation', 'Hayaza Check', 'Other']
 MODES = ['Plate', 'VIN label', 'VIN barcode / QR', 'Manual']
 UNMATCHED = 'Not in fleet (save as unmatched)'
+EMIRATES = ['Auto', 'AUH', 'DXB', 'SHJ', 'AJM', 'UAQ', 'RAK', 'FUJ']
 
 st.set_page_config(page_title='Fleet Scan', page_icon='🚘', layout='centered', initial_sidebar_state='collapsed')
 st.markdown('''<style>
@@ -135,24 +136,25 @@ def weak(matches):
     return not matches or fr.band(matches[0]['confidence']) != 'strong'
 
 
-def run_read(img, h, mode, kind, fleet, ai_cfg=None):
+def run_read(img, h, mode, kind, fleet, ai_cfg=None, emirate='Auto'):
     ss = st.session_state
-    if ss.get('read_key') == (h, mode):
-        return  # same photo and mode already read: never reprocess on rerun
+    if ss.get('read_key') == (h, mode, emirate):
+        return  # same photo, mode and emirate already read: never reprocess on rerun
     status = st.status('Reading photo...', expanded=True)
     try:
         stop = fr.make_stop_fn(fleet, kind)
-        res = ir.process(img, mode, stop, status.write, framed=bool(ss.get('photo_framed')))
+        res = ir.process(img, mode, stop, status.write, framed=bool(ss.get('photo_framed')), emirate=emirate)
         status.write('Matching fleet records')
         with utils.timed('fleet_match'):
-            matches = fr.find_candidates(fleet, res.candidates[:60], kind)
+            matches = fr.find_candidates(fleet, res.candidates[:60], kind, emirate=emirate)
         local_cands, ai_cands = [], []
         if res.source != 'barcode' and weak(matches) and local_reader.available():
             status.write('Second reader (free, runs on this server)')
             with utils.timed('local_read'):
-                local_cands = local_reader.read_local(img, kind)
+                local_cands = local_reader.read_local(img, kind, emirate)
             if local_cands:
-                matches = fr.merge_matches(matches, fr.find_candidates(fleet, local_cands[:60], kind), '2nd reader')
+                matches = fr.merge_matches(
+                    matches, fr.find_candidates(fleet, local_cands[:60], kind, emirate=emirate), '2nd reader')
         if (ai_cfg and res.source != 'barcode' and ss.get('ai_calls', 0) < ai_reader.CALL_LIMIT
                 and weak(matches)):
             status.write('Double-checking with AI')
@@ -160,14 +162,15 @@ def run_read(img, h, mode, kind, fleet, ai_cfg=None):
             with utils.timed('ai_read'):
                 ai_cands = ai_reader.read_with_ai(img, kind, ai_cfg)
             if ai_cands:
-                matches = fr.merge_matches(matches, fr.find_candidates(fleet, ai_cands, kind), 'AI-assisted')
+                matches = fr.merge_matches(
+                    matches, fr.find_candidates(fleet, ai_cands, kind, emirate=emirate), 'AI-assisted')
         status.update(label='Done', state='complete', expanded=False)
     except Exception:
         log.exception('read failed')
         status.update(label='Failed', state='error')
         st.error('Camera image could not be processed.')
         return
-    ss.update(read_key=(h, mode), matches=matches, searched=True, ocr_conf=res.confidence,
+    ss.update(read_key=(h, mode, emirate), matches=matches, searched=True, ocr_conf=res.confidence,
               photo_raw=ss.get('photo_raw'), sel_nonce=ss.get('sel_nonce', 0) + 1)
     all_cands = ai_cands + local_cands + res.candidates
     if matches and matches[0]['confidence'] >= .8:
@@ -198,6 +201,9 @@ def scan_tab(user, fleet, storage, repo, required_actions, ai_cfg=None):
         st.success(ss.pop('flash'))
     mode = st.segmented_control('Scan type', MODES, default='Plate', key='mode') or 'Plate'
     kind = 'VIN' if mode.startswith('VIN') else 'Plate'
+    emirate = 'Auto'
+    if kind == 'Plate':
+        emirate = st.segmented_control('Emirate (plate style)', EMIRATES, default='Auto', key='emirate') or 'Auto'
     n = ss['cam_n']
     if mode != 'Manual':  # live camera with a guide frame; the browser crops to the frame
         shot = frame_camera(kind, n)
@@ -230,7 +236,7 @@ def scan_tab(user, fleet, storage, repo, required_actions, ai_cfg=None):
         if not needs and not ir.ocr_available() and not local_reader.available():
             box('warn', 'Text reader is not available on this server. Use Manual mode.')
         if st.button('Read photo', type='primary', width='stretch', disabled=img is None):
-            run_read(img, h, mode, kind, fleet, ai_cfg)
+            run_read(img, h, mode, kind, fleet, ai_cfg, emirate)
         if ai_cfg:
             st.caption('If both readers are unsure, the cropped photo is sent to an AI service for a second opinion.')
     if st.button('Retake / reset', width='stretch'):
@@ -241,7 +247,7 @@ def scan_tab(user, fleet, storage, repo, required_actions, ai_cfg=None):
 
     value = st.text_input('Confirm or correct ' + kind, key='value_input')
     if st.button('Find vehicle', type='primary', width='stretch', disabled=not value.strip()):
-        ss.update(matches=fr.find_candidates(fleet, [value], kind, manual=True), searched=True,
+        ss.update(matches=fr.find_candidates(fleet, [value], kind, manual=True, emirate=emirate), searched=True,
                   sel_nonce=ss.get('sel_nonce', 0) + 1)
     if not ss.get('searched'):
         return
@@ -283,11 +289,11 @@ def scan_tab(user, fleet, storage, repo, required_actions, ai_cfg=None):
         go = st.form_submit_button('Confirm and save', type='primary', width='stretch')
     if go:
         save_scan(user, fleet, storage, repo, required_actions, mode, kind, action, q, utils.norm_vin(cv),
-                  cp, loc, notes, rec, owner, reason, conf)
+                  cp, loc, notes, rec, owner, reason, conf, emirate)
 
 
 def save_scan(user, fleet, storage, repo, required_actions, mode, kind, action, query, vin, plate, loc,
-              notes, rec, owner, reason, conf):
+              notes, rec, owner, reason, conf, emirate='Auto'):
     ss = st.session_state
     raw = ss.get('photo_raw')
     err = utils.validate_save(action, bool(raw), required_actions)
@@ -331,11 +337,12 @@ def save_scan(user, fleet, storage, repo, required_actions, mode, kind, action, 
     record = {
         'scan_id': uuid.uuid4().hex, 'username': user['username'], 'display_name': user['display_name'],
         'login_time': ss.get('login_time', ''), 'scanned_on': utils.now_dubai().strftime('%Y-%m-%d %H:%M:%S'),
-        'scanned_by': user['display_name'], 'action': action, 'scan_type': mode, 'scanned_value': query,
-        'confirmed_vin': vin, 'confirmed_plate': plate, 'owner': owner, 'unit': rec['_unit'],
-        'make': rec['_make'], 'model': rec['_model'], 'year': rec['_year'], 'branch': rec['_branch'],
-        'location': loc, 'status': rec['_status'], 'match_method': reason, 'match_confidence': conf,
-        'ocr_confidence': ss.get('ocr_conf'), 'source_file': rec['_file'], 'notes': notes, **photo}
+        'scanned_by': user['display_name'], 'action': action, 'scan_type': mode, 'emirate': emirate,
+        'scanned_value': query, 'confirmed_vin': vin, 'confirmed_plate': plate, 'owner': owner,
+        'unit': rec['_unit'], 'make': rec['_make'], 'model': rec['_model'], 'year': rec['_year'],
+        'branch': rec['_branch'], 'location': loc, 'status': rec['_status'], 'match_method': reason,
+        'match_confidence': conf, 'ocr_confidence': ss.get('ocr_conf'), 'source_file': rec['_file'],
+        'notes': notes, **photo}
     try:
         with utils.timed('db_save'):
             repo.add(record)
