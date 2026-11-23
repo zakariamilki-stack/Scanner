@@ -91,9 +91,24 @@ def read_fleet_csv(path):
     return df
 
 
+def _locate_csv(path):
+    """Find the CSV even if the name has stray spaces/case or the working folder differs."""
+    import glob
+    if os.path.exists(path):
+        return path
+    here = os.path.dirname(os.path.abspath(__file__))
+    wanted = os.path.basename(path).replace(' ', '').lower()
+    for folder in (os.path.dirname(os.path.abspath(path)), here, os.getcwd()):
+        for f in glob.glob(os.path.join(folder, '*.csv')):
+            if os.path.basename(f).replace(' ', '').lower() == wanted:
+                return f
+    raise FileNotFoundError(
+        f'{path} not found. Looked in: {here} and {os.getcwd()}. '
+        f'Files there: {sorted(os.listdir(here))[:30]}')
+
+
 def load_index(path):
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
+    path = _locate_csv(path)
     with timed('fleet_index_load'):
         df = normalize_frame(read_fleet_csv(path))
     if df.empty:
