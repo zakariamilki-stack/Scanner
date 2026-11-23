@@ -201,6 +201,7 @@ def scan_tab(user, fleet, storage, repo, required_actions, ai_cfg=None):
         st.success(ss.pop('flash'))
     mode = st.segmented_control('Scan type', MODES, default='Plate', key='mode') or 'Plate'
     kind = 'VIN' if mode.startswith('VIN') else 'Plate'
+    emirate = 'Auto'  # FIX: always defined, so VIN modes no longer raise UnboundLocalError
     if kind == 'Plate':
         emirate = st.segmented_control('Emirate (plate style)', EMIRATES, default='Auto', key='emirate') or 'Auto'
     n = ss['cam_n']
