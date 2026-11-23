@@ -13,7 +13,7 @@ log = logging.getLogger('fleetscan')
 COLUMNS = {
     'id': 'INTEGER PRIMARY KEY', 'scan_id': 'TEXT', 'username': 'TEXT', 'display_name': 'TEXT',
     'login_time': 'TEXT', 'scanned_on': 'TEXT', 'scanned_by': 'TEXT', 'action': 'TEXT',
-    'scan_type': 'TEXT', 'scanned_value': 'TEXT', 'confirmed_vin': 'TEXT', 'confirmed_plate': 'TEXT',
+    'scan_type': 'TEXT', 'emirate': 'TEXT', 'scanned_value': 'TEXT', 'confirmed_vin': 'TEXT', 'confirmed_plate': 'TEXT',
     'owner': 'TEXT', 'unit': 'TEXT', 'make': 'TEXT', 'model': 'TEXT', 'year': 'TEXT',
     'branch': 'TEXT', 'location': 'TEXT', 'status': 'TEXT', 'match_method': 'TEXT',
     'match_confidence': 'REAL', 'ocr_confidence': 'REAL', 'source_file': 'TEXT',
