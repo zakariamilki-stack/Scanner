@@ -227,7 +227,7 @@ def _find(fleet, observed, kind, manual=False, limit=3, full=None):
                 d, letters = re.sub(r'\D', '', o), re.sub(r'[^A-Z]', '', o)
                 if d and letters:
                     m = _digits_match(fleet, d) & fleet['_pletters'].str.contains(letters, regex=False)
-                    add(fleet.index[m], .96, 'Numeric plate match')
+                    add(fleet.indexate match')
         if not found:
             for o in obs:
                 d = re.sub(r'\D', '', o)
@@ -259,7 +259,7 @@ def _find(fleet, observed, kind, manual=False, limit=3, full=None):
 
 
 def make_stop_fn(fleet, kind):
-    """Cheap by OCR for early stopping."""
+    """Cheap membership test used by OCR for early stopping."""
     if fleet.empty:
         return None
     if kind == 'VIN':
