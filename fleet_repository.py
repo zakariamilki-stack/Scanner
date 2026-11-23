@@ -47,7 +47,7 @@ def normalize_frame(df):
 
 
 def _clean_header(h):
-    """' VIN ', 'Plate Emirate', '\\ufeffvin' -> 'vin', 'plate_emirate', 'vin'."""
+    """Normalise a header: strip spaces/BOM, lowercase, underscores, then apply aliases."""
     h = str(h).replace('\ufeff', '').strip().lower()
     h = re.sub(r'[^a-z0-9]+', '_', h).strip('_')
     return HEADER_ALIASES.get(h, h)
@@ -178,10 +178,12 @@ def _find(fleet, observed, kind, manual=False, limit=3, full=None):
     if fleet.empty:
         return []
     found = {}
+    best_conf = {}
 
     def add(idx, conf, reason):
         for i in idx:
-            if i not in found or conf > found[i][0]:
+            if conf > best_conf.get(i, -1.0):
+                best_conf[i] = conf
                 found[i] = (conf, reason)
 
     if kind == 'VIN':
@@ -227,7 +229,7 @@ def _find(fleet, observed, kind, manual=False, limit=3, full=None):
                 d, letters = re.sub(r'\D', '', o), re.sub(r'[^A-Z]', '', o)
                 if d and letters:
                     m = _digits_match(fleet, d) & fleet['_pletters'].str.contains(letters, regex=False)
-                    add(fleet.indexate match')
+                    add(fleet.index[m], .96, 'Numeric plate match')
         if not found:
             for o in obs:
                 d = re.sub(r'\D', '', o)
