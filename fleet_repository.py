@@ -1,5 +1,6 @@
 """Fleet index loading, ownership rule, and transparent candidate ranking."""
 import difflib
+import io
 import logging
 import os
 import re
@@ -16,6 +17,15 @@ RENAME = {'vin': '_vin', 'plate': '_plate', 'unit': '_unit', 'make': '_make', 'm
           'plate_number': '_pnum', 'vin_last5': '_vin5'}
 FIELDS = list(RENAME.values())
 OWNER_RANK = {'Moov': 0, 'Hertz': 1, 'AFF': 2}
+
+# Alternative header names that are mapped to the standard ones above
+HEADER_ALIASES = {
+    'vin_no': 'vin', 'vin_number': 'vin', 'chassis': 'vin', 'chassis_no': 'vin',
+    'chassis_number': 'vin', 'vehicle_chassis_number': 'vin',
+    'plate_no': 'plate',
+    'unit_no': 'unit', 'unit_number': 'unit', 'vehicle_unit_number_identifier': 'unit',
+    'source': 'source_file', 'sheet': 'source_sheet',
+}
 
 
 def normalize_frame(df):
@@ -36,11 +46,59 @@ def normalize_frame(df):
     return df[(df['_vin'] != '') | (df['_plate'] != '')].reset_index(drop=True)
 
 
+def _clean_header(h):
+    """' VIN ', 'Plate Emirate', '\\ufeffvin' -> 'vin', 'plate_emirate', 'vin'."""
+    h = str(h).replace('\ufeff', '').strip().lower()
+    h = re.sub(r'[^a-z0-9]+', '_', h).strip('_')
+    return HEADER_ALIASES.get(h, h)
+
+
+def _decode(raw):
+    """Handle UTF-16, UTF-8 (with or without BOM) and Excel's Windows-1252 'CSV'."""
+    if raw.startswith(b'\xff\xfe') or raw.startswith(b'\xfe\xff'):
+        return raw.decode('utf-16')
+    for enc in ('utf-8-sig', 'cp1252'):
+        try:
+            return raw.decode(enc)
+        except UnicodeError:
+            pass
+    return raw.decode('latin-1')
+
+
+def _detect_sep(text):
+    """Comma, semicolon, tab or pipe, taken from the header line."""
+    first = next((ln for ln in text.splitlines() if ln.strip()), '')
+    counts = {s: first.count(s) for s in (',', ';', '\t', '|')}
+    sep = max(counts, key=counts.get)
+    return sep if counts[sep] else ','
+
+
+def read_fleet_csv(path):
+    """Read the CSV whatever the encoding, delimiter or header style."""
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if not raw.strip():
+        raise ValueError('fleet_index.csv is empty')
+    if raw.startswith(b'version https://git-lfs'):
+        raise ValueError('fleet_index.csv is a Git LFS pointer, not the real file')
+    text = _decode(raw)
+    df = pd.read_csv(io.StringIO(text), sep=_detect_sep(text), dtype=str,
+                     keep_default_na=False, on_bad_lines='skip')
+    df.columns = [_clean_header(c) for c in df.columns]
+    df = df.loc[:, ~pd.Index(df.columns).duplicated()]
+    if not ({'vin', 'plate', 'plate_number'} & set(df.columns)):
+        raise ValueError('No vin/plate column found. Columns read: ' + ', '.join(df.columns))
+    return df
+
+
 def load_index(path):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     with timed('fleet_index_load'):
-        return normalize_frame(pd.read_csv(path, dtype=str, keep_default_na=False, encoding='utf-8-sig'))
+        df = normalize_frame(read_fleet_csv(path))
+    if df.empty:
+        raise ValueError('fleet_index.csv has no rows with a VIN or plate')
+    return df
 
 
 def pick_owner(owners):
@@ -201,7 +259,7 @@ def _find(fleet, observed, kind, manual=False, limit=3, full=None):
 
 
 def make_stop_fn(fleet, kind):
-    """Cheap membership test used by OCR for early stopping."""
+    """Cheap by OCR for early stopping."""
     if fleet.empty:
         return None
     if kind == 'VIN':
