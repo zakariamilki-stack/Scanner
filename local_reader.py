@@ -43,7 +43,7 @@ def vin_candidates(strings):
     return direct + alts[:40] + near
 
 
-def read_local(img, kind, timeout=12.0):
+def read_local(img, kind, emirate='Auto', timeout=12.0):
     """Return candidate strings (plate tokens or VINs); [] on any failure."""
     start = time.monotonic()
     arr = np.array(img.convert('RGB'))
@@ -59,4 +59,4 @@ def read_local(img, kind, timeout=12.0):
         strings += [str(t) for t in (res.txts or ())]
         if kind == 'VIN' and any(is_valid_vin(w) for s in strings for w in vin_windows(s)):
             break
-    return plate_tokens(strings) if kind == 'Plate' else vin_candidates(strings)
+    return plate_tokens(strings, emirate) if kind == 'Plate' else vin_candidates(strings)
